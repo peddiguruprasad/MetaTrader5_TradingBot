@@ -19,6 +19,83 @@ import queue
 import sys
 import random
 
+class TradingBotLogFilter(logging.Filter):
+    """Enhanced filter to aggressively reduce repetitive log messages"""
+    def __init__(self, name=''):
+        super().__init__(name)
+        self.last_messages = {}
+        self.message_counts = {}
+        self.throttle_interval = 30  # Reduced from 60 seconds
+        self.counter = 0
+        
+        # Expanded patterns to throttle
+        self.throttle_patterns = [
+            "volatility detected",
+            "No signal for",
+            "DEBUG: Margin level",
+            "calculate_market_volatility",
+            "Enhanced range detection",
+            "Adjusting range detection threshold",
+            "SUPER-EXTREME volatility",
+            "detect_market_regime",
+            "Market regime for",
+            "range detection for"
+        ]
+
+    def filter(self, record):
+        # Always allow ERROR and WARNING messages
+        if record.levelno >= logging.WARNING:
+            return True
+            
+        # Get the message
+        message = record.getMessage()
+        
+        # Aggressively filter the most common repetitive messages
+        if "SUPER-EXTREME volatility detected" in message:
+            self.counter += 1
+            return self.counter % 500 == 0  # Only show 1 in 500 of these messages
+            
+        # Check for other patterns we want to throttle
+        for pattern in self.throttle_patterns:
+            if pattern in message:
+                now = time.time()
+                key = f"{pattern}"
+                
+                # If this type of message was seen recently
+                if key in self.last_messages:
+                    # If we're in throttle period
+                    if now - self.last_messages[key] < self.throttle_interval:
+                        self.message_counts[key] = self.message_counts.get(key, 0) + 1
+                        # Log very rarely to show we're still working
+                        if self.message_counts[key] % 200 == 0:
+                            logging.info(f"Suppressed {self.message_counts[key]} similar '{pattern}' messages")
+                            return True
+                        return False
+                    else:
+                        # Reset counter and allow message
+                        count = self.message_counts.get(key, 0)
+                        if count > 0:
+                            self.message_counts[key] = 0
+                
+                # Update last seen time
+                self.last_messages[key] = now
+                return True
+        
+        # Allow all other messages
+        return True
+    
+def apply_log_filter_to_all_handlers():
+    """Apply the TradingBotLogFilter to all existing log handlers"""
+    log_filter = TradingBotLogFilter()
+    
+    # Apply to all existing handlers
+    for handler in logging.root.handlers[:]:
+        handler.addFilter(log_filter)
+    
+    logging.info("Applied aggressive log filtering to reduce terminal output")
+    
+    return log_filter
+
 # ======================================================
 # CONFIGURATION AND CONSTANTS
 # ======================================================
@@ -74,9 +151,9 @@ DEFAULT_CONFIG = {
         "news_check_timeframe": "24",
         "use_news_filter": "False"
     },
-    "Account": {
-        "account_number": "Add_Account_Number",
-        "password": "Add_Password",
+     "Account": {
+        "account_number": "ADD_ACCOUNTNUMBER",
+        "password": "ADD_PASSWORD",
         "server": "Exness-MT5Trial8",
         "use_env_vars": "True"
     },
@@ -685,7 +762,7 @@ def calculate_advanced_stop_loss_take_profit(symbol, order_type, entry_price, ma
                 if volatility_level == "super-extreme":
                     # ENHANCED: Better SL/TP for super-extreme volatility
                     sl_percent = 0.022  # 2.2% stop loss - reduced from 2.5% for tighter protection
-                    tp_percent = 1.2  # 6% take profit target - increased from 5% for better rewards
+                    tp_percent = 0.06  # 6% take profit target - FIX: Changed from 1.2 (120%) to 0.06 (6%)
                 elif volatility_level == "extreme":
                     sl_percent = 0.018  # 1.8% stop loss
                     tp_percent = 0.045  # 4.5% take profit - increased from 4%
@@ -738,6 +815,12 @@ def calculate_advanced_stop_loss_take_profit(symbol, order_type, entry_price, ma
                     tp_percent *= 2.0  # DOUBLE the take profit target
                     logging.info(f"Setting extremely ambitious profit target (doubled) due to strong {market_regime}")
             
+            # NEW: Add a maximum cap on TP percentage (50% of price)
+            MAX_TP_PERCENT = 0.5  # Maximum 50% move for take profit
+            if tp_percent > MAX_TP_PERCENT:
+                logging.info(f"Capping excessive TP percentage from {tp_percent:.4f} to {MAX_TP_PERCENT:.4f}")
+                tp_percent = MAX_TP_PERCENT
+            
             # Calculate stop loss and take profit based on percentages
             if order_type == "BUY":
                 stop_loss = entry_price * (1 - sl_percent)
@@ -778,6 +861,12 @@ def calculate_advanced_stop_loss_take_profit(symbol, order_type, entry_price, ma
                     tp_multiplier *= 2.0  # DOUBLE the take profit target
                     logging.info(f"Setting extremely ambitious profit target (doubled) due to strong {market_regime}")
             
+            # NEW: Add a hard cap on TP multiplier to prevent unrealistic targets
+            MAX_TP_MULTIPLIER = 15.0  # Reasonable maximum multiplier
+            if tp_multiplier > MAX_TP_MULTIPLIER:
+                logging.info(f"Capping excessive TP multiplier from {tp_multiplier:.2f} to {MAX_TP_MULTIPLIER:.2f}")
+                tp_multiplier = MAX_TP_MULTIPLIER
+            
             # Calculate stop loss and take profit based on ATR
             if order_type == "BUY":
                 stop_loss = entry_price - (atr * sl_multiplier)
@@ -785,6 +874,15 @@ def calculate_advanced_stop_loss_take_profit(symbol, order_type, entry_price, ma
             else:  # "SELL"
                 stop_loss = entry_price + (atr * sl_multiplier)
                 take_profit = entry_price - (atr * tp_multiplier)
+            
+            # NEW: Additional constraint - TP distance can't be more than 50% of current price
+            max_tp_distance = entry_price * 0.5  # Max 50% move from entry
+            if order_type == "BUY" and (take_profit - entry_price) > max_tp_distance:
+                logging.info(f"Reducing TP distance to 50% of entry price")
+                take_profit = entry_price + max_tp_distance
+            elif order_type == "SELL" and (entry_price - take_profit) > max_tp_distance:
+                logging.info(f"Reducing TP distance to 50% of entry price")
+                take_profit = entry_price - max_tp_distance
                 
             # Use pattern target if available and better than calculated target
             if pattern_target is not None:
@@ -816,7 +914,7 @@ def calculate_advanced_stop_loss_take_profit(symbol, order_type, entry_price, ma
                 
         # ENHANCED: Detailed logging of SL/TP calculation
         logging.info(f"Advanced SL/TP for {symbol} {order_type}: " +
-                    f"Entry={entry_price:.2f}, SL={stop_loss:.2f}, TP={take_profit:.2f}, " +
+                    f"Entry={entry_price}, SL={stop_loss}, TP={take_profit}, " +
                     f"Volatility={volatility_level}, Regime={market_regime}")
                 
         return stop_loss, take_profit
@@ -1817,6 +1915,122 @@ def get_min_lot_size(symbol):
     if symbol_info:
         return symbol_info.volume_min
     return 0.01  # Default minimum
+def signal_handler(sig, frame):
+    logging.warning(f"Received {signal.Signals(sig).name}, initiating graceful shutdown")
+    
+    try:
+        # Only prompt for input if not running in non-interactive mode
+        if sys.stdout.isatty():  # Check if running in interactive terminal
+            response = input("\nDo you want to close all open positions? (y/n, 10s to answer, default: n): ")
+            close_positions = response.lower() in ('y', 'yes')
+        else:
+            close_positions = False
+    except:
+        # If any error occurs during input, default to protecting with stops
+        close_positions = False
+        
+    # Call our new improved handler first
+    improved_shutdown_handler(close_positions)
+    
+    # Then call your existing handlers for compatibility
+    enhanced_shutdown_handler()
+    shutdown_handler()
+    
+    sys.exit(0)
+
+def improved_shutdown_handler(close_positions=False):
+    """Enhanced shutdown handler with option to close all positions"""
+    logging.info("IMPROVED SHUTDOWN SEQUENCE INITIATED")
+    
+    # Get all open positions
+    positions = mt5.positions_get()
+    if positions is None or len(positions) == 0:
+        logging.info("No positions to manage during shutdown")
+        logging.info("SHUTDOWN: Improved shutdown sequence completed")
+        return
+    
+    position_count = len(positions)
+    logging.info(f"Managing {position_count} open positions during shutdown")
+    
+    if close_positions:
+        # Close all positions
+        closed_count = 0
+        for position in positions:
+            # Prepare close request
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "position": position.ticket,
+                "symbol": position.symbol,
+                "volume": position.volume,
+                "type": mt5.ORDER_TYPE_SELL if position.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+                "price": mt5.symbol_info_tick(position.symbol).bid if position.type == mt5.POSITION_TYPE_BUY else mt5.symbol_info_tick(position.symbol).ask,
+                "deviation": 50,
+                "magic": position.magic,
+                "comment": "close on shutdown",
+                "type_time": mt5.ORDER_TIME_GTC,
+            }
+            
+            # Try up to 3 times
+            for attempt in range(1, 4):
+                result = mt5.order_send(request)
+                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                    logging.info(f"SHUTDOWN: Closed position {position.ticket} {position.symbol}")
+                    # KEEP YOUR EXISTING write_trade_notes CALL HERE IF APPLICABLE
+                    write_trade_notes(f"Closed {position.symbol} position on shutdown")
+                    closed_count += 1
+                    break
+                else:
+                    logging.warning(f"SHUTDOWN: Failed to close position {position.ticket} on attempt {attempt}: {result.retcode if result else 'Unknown error'}")
+                    time.sleep(0.3)  # Wait before retry
+        
+        logging.info(f"SHUTDOWN: Closed {closed_count}/{position_count} positions during shutdown")
+    else:
+        # Tighten stops for risk management
+        updated_count = 0
+        for position in positions:
+            # Get current price
+            symbol = position.symbol
+            price_info = mt5.symbol_info_tick(symbol)
+            if price_info is None:
+                continue
+                
+            current_price = price_info.bid if position.type == mt5.POSITION_TYPE_BUY else price_info.ask
+            
+            # Calculate safe stop loss (closer to current price for protection)
+            if position.type == mt5.POSITION_TYPE_BUY:
+                # For buy positions, move stop loss to 1.2% below current price, unless original SL is tighter
+                new_sl = current_price * 0.988  # Slightly tighter than original 0.995
+                if position.sl is not None and position.sl > new_sl:
+                    new_sl = position.sl  # Keep original SL if it's tighter
+            else:
+                # For sell positions, move stop loss to 1.2% above current price, unless original SL is tighter
+                new_sl = current_price * 1.012  # Slightly tighter than original 1.005
+                if position.sl is not None and position.sl < new_sl:
+                    new_sl = position.sl  # Keep original SL if it's tighter
+            
+            # Update the position's stop loss
+            request = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": position.ticket,
+                "sl": new_sl,
+                "tp": position.tp  # Keep original TP
+            }
+            
+            # Try up to 3 times
+            for attempt in range(1, 4):
+                result = mt5.order_send(request)
+                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                    logging.info(f"SHUTDOWN: Updated SL for position {position.ticket} to {new_sl}")
+                    write_trade_notes(f"Updated SL for {position.symbol} to {new_sl} on shutdown")
+                    updated_count += 1
+                    break
+                else:
+                    logging.warning(f"SHUTDOWN: Failed to update SL for position {position.ticket} on attempt {attempt}: {result.retcode if result else 'Unknown error'}")
+                    time.sleep(0.3)  # Wait before retry
+        
+        logging.info(f"SHUTDOWN: Updated stop losses for {updated_count}/{position_count} positions")
+    
+    logging.info("SHUTDOWN: Improved shutdown sequence completed")
 
 def setup_error_handling():
     """
@@ -9063,61 +9277,60 @@ def place_market_order(symbol, order_type, lot_size, sl, tp, comment=""):
                 
             return ticket
         
-        # STRATEGY 6: Try ultra-minimal approach (for crypto trading)
-        minimal_request = {
+        # STRATEGY 6: Sending ultra-minimal order
+        request_minimal = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "volume": lot_size,
-            "type": mt5_order_type,
+            "type": mt5.ORDER_TYPE_BUY if order_type == "BUY" else mt5.ORDER_TYPE_SELL,
             "price": price,
-            # NEW: Add deviation for Bitcoin
-            "deviation": 80 if is_bitcoin else 30
+            "deviation": 80
         }
-        
-        logging.info(f"STRATEGY 6: Sending ultra-minimal order: {minimal_request}")
-        result = mt5.order_send(minimal_request)
-        
-        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            ticket = result.order
-            logging.info(f"Market order placed successfully with STRATEGY 6: {order_type} {symbol} {lot_size} lots at {price}")
-            
-            # Wait slightly before attempting to add SL/TP
-            time.sleep(0.5)
-            
-            # Try to add SL/TP
-            modify_request = {
-                "action": mt5.TRADE_ACTION_SLTP,
-                "symbol": symbol,
-                "position": ticket,
-                "sl": sl,
-                "tp": tp
-            }
-            
-            modify_result = mt5.order_send(modify_request)
-            if modify_result and modify_result.retcode == mt5.TRADE_RETCODE_DONE:
-                logging.info(f"Successfully added SL/TP to position {ticket}")
-            else:
-                logging.warning(f"Failed to add SL/TP to position {ticket}")
-            
-            write_trade_notes(f"Opened {order_type} position on {symbol}: {lot_size} lots at {price}, SL: {sl}, TP: {tp}")
-            
-            # IMPROVED: Verify position was created with multiple attempts
-            verified = False
-            for verification_attempt in range(5):
-                time.sleep(0.5)
-                positions = get_positions(symbol)
-                position = next((p for p in positions if p.ticket == ticket), None)
-                if position:
-                    logging.info(f"Position {ticket} verified with SL={position.sl}, TP={position.tp} on attempt {verification_attempt+1}")
-                    verified = True
-                    break
-                time.sleep(0.5)
-            
-            if not verified:
-                logging.warning(f"Could not verify position {ticket} was created - please check manually")
+        logging.info(f"place_market_order - STRATEGY 6: Sending ultra-minimal order: {request_minimal}")
+        for retry_attempt in range(1, 4):  # Try up to 3 times
+            order_result = mt5.order_send(request_minimal)
+            if order_result and order_result.retcode == mt5.TRADE_RETCODE_DONE:
+                order_ticket = order_result.order
+                logging.info(f"place_market_order - Market order placed successfully with STRATEGY 6: {order_type} {symbol} {lot_size} lots at {price}")
                 
-            return ticket
-        
+                # Add delay before adding SL/TP to ensure order is processed
+                time.sleep(0.5)
+                
+                # Now add SL/TP to the position
+                position_ticket = order_result.order
+                modify_request = {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": position_ticket,
+                    "sl": sl,
+                    "tp": tp
+                }
+                
+                for modify_attempt in range(1, 4):  # Try up to 3 times to add SL/TP
+                    modify_result = mt5.order_send(modify_request)
+                    if modify_result and modify_result.retcode == mt5.TRADE_RETCODE_DONE:
+                        logging.info(f"place_market_order - Successfully added SL/TP to position {position_ticket}")
+                        # KEEP YOUR EXISTING write_trade_notes CALL HERE
+                        write_trade_notes(f"Opened {order_type} position on {symbol}: {lot_size} lots at {price}, SL: {sl}, TP: {tp}")
+                        break
+                    else:
+                        logging.warning(f"place_market_order - Failed to add SL/TP on attempt {modify_attempt}: {modify_result.retcode if modify_result else 'Unknown error'}")
+                        time.sleep(0.5)  # Wait before retry
+                
+                # Verify SL/TP were correctly applied to position
+                added_successfully = verify_position_sl_tp(position_ticket, sl, tp)
+                if added_successfully:
+                    return order_ticket
+                else:
+                    logging.error(f"place_market_order - Failed to verify SL/TP for position {position_ticket}")
+                    return order_ticket  # Return the ticket anyway since order was placed
+            
+            else:
+                logging.warning(f"place_market_order - STRATEGY 6 attempt {retry_attempt} failed: {order_result.retcode if order_result else 'Unknown error'}")
+                time.sleep(0.3)  # Short delay before retry
+
+        return None  # Return None if all attempts fail
+
+
         # STRATEGY 7: Try with market order type
         market_request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -9176,7 +9389,33 @@ def place_market_order(symbol, order_type, lot_size, sl, tp, comment=""):
         logging.error(f"Error placing market order: {e}")
         logging.error(traceback.format_exc())
         return None
+
+def verify_position_sl_tp(position_ticket, expected_sl, expected_tp, max_attempts=5):
+    """Verify that a position has the correct SL/TP values"""
+    for attempt in range(1, max_attempts + 1):
+        positions = mt5.positions_get(ticket=position_ticket)
+        if not positions:
+            logging.warning(f"Position {position_ticket} not found on verification attempt {attempt}")
+            time.sleep(0.5)
+            continue
+            
+        position = positions[0]
+        
+        # Check if SL and TP are set correctly (with small tolerance for rounding)
+        sl_correct = abs(position.sl - expected_sl) < 0.0001 if position.sl and expected_sl else position.sl == expected_sl
+        tp_correct = abs(position.tp - expected_tp) < 0.0001 if position.tp and expected_tp else position.tp == expected_tp
+        
+        if sl_correct and tp_correct:
+            logging.info(f"Position {position_ticket} verified with SL={position.sl}, TP={position.tp} on attempt {attempt}")
+            return True
+        
+        if attempt < max_attempts:
+            logging.warning(f"SL/TP verification failed on attempt {attempt}. Position has SL={position.sl}, TP={position.tp}, expected SL={expected_sl}, TP={expected_tp}")
+            time.sleep(0.5)  # Wait before checking again
     
+    logging.error(f"Failed to verify SL/TP for position {position_ticket} after {max_attempts} attempts")
+    return False
+
 def close_position(ticket, partial_lots=None):
     """
     Close an open position by ticket number.
@@ -10707,6 +10946,8 @@ def main_enhanced():
     try:
         logging.info("=== Starting Advanced MT5 Trading Bot ===")
         logging.info(f"Configured to trade: {', '.join(SYMBOLS)}")
+
+        apply_log_filter_to_all_handlers()
 
         # Check and install required packages
         ensure_required_packages()
