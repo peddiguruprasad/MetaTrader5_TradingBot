@@ -333,6 +333,7 @@ LOG_FILE = "trading_bot.log"
 # ======================================================
 # LOGGING SETUP
 # ======================================================
+
 def log_trade_details(action, symbol, order_type, lot_size, entry_price, sl, tp, ticket=None, additional_info=None):
     """Centralized function for logging trade details in a standardized format"""
     if action.lower() == 'open':
@@ -2636,152 +2637,163 @@ def enhanced_shutdown_handler():
     network issues, or program termination.
     """
     logging.info("ENHANCED SHUTDOWN SEQUENCE INITIATED")
-    
+    close_positions = False
     try:
-        # Get all open positions
-        positions = get_positions()
-        logging.info(f"Managing {len(positions)} open positions during shutdown")
-        
-        protected_count = 0
-        
-        for position in positions:
-            position_id = position.ticket
-            symbol = position.symbol
-            position_type = position.type
-            entry_price = position.price_open
+        # Only prompt for input in interactive mode
+        if sys.stdout.isatty():
+            response = input("\nDo you want to close all open positions? (y/n, 5s to answer, default: n): ")
+            if response.lower() in ('y', 'yes'):
+                close_positions = True
+    except:
+        pass
+    
+    # Then continue with your existing code, but add position closing logic:
+    if close_positions:
+        try:
+            # Get all open positions
+            positions = get_positions()
+            logging.info(f"Managing {len(positions)} open positions during shutdown")
             
-            try:
-                # Get current market data
-                current_price = mt5.symbol_info_tick(symbol).bid if position_type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(symbol).ask
+            protected_count = 0
+            
+            for position in positions:
+                position_id = position.ticket
+                symbol = position.symbol
+                position_type = position.type
+                entry_price = position.price_open
                 
-                # 1. Ensure all positions have stop losses - NEW: More aggressive protection
-                if position.sl is None:
-                    # Get market data for smarter stop placement
-                    df = get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"], num_bars=20)
-                    if df is not None:
-                        atr = calculate_atr(df)
-                        
-                        # Set stop based on ATR if available
-                        if position_type == mt5.ORDER_TYPE_BUY:
-                            # Set stop 1.5 ATR below current price or at 98% of entry, whichever is higher
-                            atr_stop = current_price - (atr * 1.5)
-                            min_stop = entry_price * 0.98
-                            stop_price = max(atr_stop, min_stop)
-                        else:  # mt5.ORDER_TYPE_SELL
-                            # Set stop 1.5 ATR above current price or at 102% of entry, whichever is lower
-                            atr_stop = current_price + (atr * 1.5)
-                            max_stop = entry_price * 1.02
-                            stop_price = min(atr_stop, max_stop)
-                    else:
-                        # Fallback if no market data available
-                        if position_type == mt5.ORDER_TYPE_BUY:
-                            stop_price = current_price * 0.99  # 1% below current price
-                        else:  # mt5.ORDER_TYPE_SELL
-                            stop_price = current_price * 1.01  # 1% above current price
+                try:
+                    # Get current market data
+                    current_price = mt5.symbol_info_tick(symbol).bid if position_type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(symbol).ask
                     
-                    # Round to appropriate precision
-                    digits = get_symbol_info(symbol).digits
-                    stop_price = round(stop_price, digits)
-                    
-                    # Set the stop loss
-                    update_position_stops(symbol, position_id, stop_price)
-                    logging.info(f"SHUTDOWN: Added safety stop loss at {stop_price:.2f} for position {position_id}")
-                    protected_count += 1
-                
-                # 2. Protect profitable positions - NEW: Lock in more profits
-                if position.sl is not None:
-                    # For positions in profit, move stops closer to secure gains
-                    if (position_type == mt5.ORDER_TYPE_BUY and current_price > entry_price) or \
-                       (position_type == mt5.ORDER_TYPE_SELL and current_price < entry_price):
-                        
-                        # Calculate profit percentage
-                        symbol_info = get_symbol_info(symbol)
-                        if symbol_info:
-                            point = symbol_info.point
+                    # 1. Ensure all positions have stop losses - NEW: More aggressive protection
+                    if position.sl is None:
+                        # Get market data for smarter stop placement
+                        df = get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"], num_bars=20)
+                        if df is not None:
+                            atr = calculate_atr(df)
                             
+                            # Set stop based on ATR if available
                             if position_type == mt5.ORDER_TYPE_BUY:
-                                profit_points = (current_price - entry_price) / point
+                                # Set stop 1.5 ATR below current price or at 98% of entry, whichever is higher
+                                atr_stop = current_price - (atr * 1.5)
+                                min_stop = entry_price * 0.98
+                                stop_price = max(atr_stop, min_stop)
                             else:  # mt5.ORDER_TYPE_SELL
-                                profit_points = (entry_price - current_price) / point
-                                
-                            profit_percent = profit_points / (entry_price / point) * 100
-                            
-                            # Set aggressive trailing stop based on profit percentage
-                            if profit_percent > 2.0:  # Significant profit
-                                if position_type == mt5.ORDER_TYPE_BUY:
-                                    # Lock in at least 75% of profit
-                                    new_stop = entry_price + (profit_points * 0.75 * point)
-                                    if new_stop > position.sl:
-                                        update_position_stops(symbol, position_id, new_stop)
-                                        logging.info(f"SHUTDOWN: Locked in 75% profit at {new_stop:.2f} for position {position_id}")
-                                        protected_count += 1
-                                else:  # mt5.ORDER_TYPE_SELL
-                                    # Lock in at least 75% of profit
-                                    new_stop = entry_price - (profit_points * 0.75 * point)
-                                    if new_stop < position.sl:
-                                        update_position_stops(symbol, position_id, new_stop)
-                                        logging.info(f"SHUTDOWN: Locked in 75% profit at {new_stop:.2f} for position {position_id}")
-                                        protected_count += 1
-                            elif profit_percent > 1.0:  # Moderate profit
-                                if position_type == mt5.ORDER_TYPE_BUY:
-                                    # Lock in at least 50% of profit
-                                    new_stop = entry_price + (profit_points * 0.5 * point)
-                                    if new_stop > position.sl:
-                                        update_position_stops(symbol, position_id, new_stop)
-                                        logging.info(f"SHUTDOWN: Locked in 50% profit at {new_stop:.2f} for position {position_id}")
-                                        protected_count += 1
-                                else:  # mt5.ORDER_TYPE_SELL
-                                    # Lock in at least 50% of profit
-                                    new_stop = entry_price - (profit_points * 0.5 * point)
-                                    if new_stop < position.sl:
-                                        update_position_stops(symbol, position_id, new_stop)
-                                        logging.info(f"SHUTDOWN: Locked in 50% profit at {new_stop:.2f} for position {position_id}")
-                                        protected_count += 1
-                            elif profit_percent > 0.5:  # Small profit
-                                # At least move to breakeven
-                                if position_type == mt5.ORDER_TYPE_BUY and position.sl < entry_price:
-                                    update_position_stops(symbol, position_id, entry_price)
-                                    logging.info(f"SHUTDOWN: Moved stop to breakeven for position {position_id}")
-                                    protected_count += 1
-                                elif position_type == mt5.ORDER_TYPE_SELL and position.sl > entry_price:
-                                    update_position_stops(symbol, position_id, entry_price)
-                                    logging.info(f"SHUTDOWN: Moved stop to breakeven for position {position_id}")
-                                    protected_count += 1
-                
-                # 3. NEW: Handle positions in significant loss
-                # For positions in significant loss, consider closing or setting tight stops
-                if (position_type == mt5.ORDER_TYPE_BUY and current_price < entry_price * 0.97) or \
-                   (position_type == mt5.ORDER_TYPE_SELL and current_price > entry_price * 1.03):
-                    
-                    # Position is in 3%+ loss - consider closing if in volatile market
-                    volatility_level, _ = calculate_market_volatility(symbol, MT5_TIMEFRAMES["PRIMARY"])
-                    
-                    if volatility_level in ["high", "extreme"]:
-                        # Close position in high volatility
-                        close_position(position_id)
-                        logging.warning(f"SHUTDOWN: Closed losing position {position_id} in {volatility_level} volatility")
-                    else:
-                        # Set tight stop to limit further losses
-                        if position_type == mt5.ORDER_TYPE_BUY:
-                            tight_stop = current_price * 0.995  # 0.5% below current
-                        else:  # mt5.ORDER_TYPE_SELL
-                            tight_stop = current_price * 1.005  # 0.5% above current
-                            
+                                # Set stop 1.5 ATR above current price or at 102% of entry, whichever is lower
+                                atr_stop = current_price + (atr * 1.5)
+                                max_stop = entry_price * 1.02
+                                stop_price = min(atr_stop, max_stop)
+                        else:
+                            # Fallback if no market data available
+                            if position_type == mt5.ORDER_TYPE_BUY:
+                                stop_price = current_price * 0.99  # 1% below current price
+                            else:  # mt5.ORDER_TYPE_SELL
+                                stop_price = current_price * 1.01  # 1% above current price
+                        
                         # Round to appropriate precision
                         digits = get_symbol_info(symbol).digits
-                        tight_stop = round(tight_stop, digits)
+                        stop_price = round(stop_price, digits)
                         
-                        update_position_stops(symbol, position_id, tight_stop)
-                        logging.warning(f"SHUTDOWN: Set tight stop at {tight_stop:.2f} for losing position {position_id}")
+                        # Set the stop loss
+                        update_position_stops(symbol, position_id, stop_price)
+                        logging.info(f"SHUTDOWN: Added safety stop loss at {stop_price:.2f} for position {position_id}")
                         protected_count += 1
+                    
+                    # 2. Protect profitable positions - NEW: Lock in more profits
+                    if position.sl is not None:
+                        # For positions in profit, move stops closer to secure gains
+                        if (position_type == mt5.ORDER_TYPE_BUY and current_price > entry_price) or \
+                        (position_type == mt5.ORDER_TYPE_SELL and current_price < entry_price):
+                            
+                            # Calculate profit percentage
+                            symbol_info = get_symbol_info(symbol)
+                            if symbol_info:
+                                point = symbol_info.point
+                                
+                                if position_type == mt5.ORDER_TYPE_BUY:
+                                    profit_points = (current_price - entry_price) / point
+                                else:  # mt5.ORDER_TYPE_SELL
+                                    profit_points = (entry_price - current_price) / point
+                                    
+                                profit_percent = profit_points / (entry_price / point) * 100
+                                
+                                # Set aggressive trailing stop based on profit percentage
+                                if profit_percent > 2.0:  # Significant profit
+                                    if position_type == mt5.ORDER_TYPE_BUY:
+                                        # Lock in at least 75% of profit
+                                        new_stop = entry_price + (profit_points * 0.75 * point)
+                                        if new_stop > position.sl:
+                                            update_position_stops(symbol, position_id, new_stop)
+                                            logging.info(f"SHUTDOWN: Locked in 75% profit at {new_stop:.2f} for position {position_id}")
+                                            protected_count += 1
+                                    else:  # mt5.ORDER_TYPE_SELL
+                                        # Lock in at least 75% of profit
+                                        new_stop = entry_price - (profit_points * 0.75 * point)
+                                        if new_stop < position.sl:
+                                            update_position_stops(symbol, position_id, new_stop)
+                                            logging.info(f"SHUTDOWN: Locked in 75% profit at {new_stop:.2f} for position {position_id}")
+                                            protected_count += 1
+                                elif profit_percent > 1.0:  # Moderate profit
+                                    if position_type == mt5.ORDER_TYPE_BUY:
+                                        # Lock in at least 50% of profit
+                                        new_stop = entry_price + (profit_points * 0.5 * point)
+                                        if new_stop > position.sl:
+                                            update_position_stops(symbol, position_id, new_stop)
+                                            logging.info(f"SHUTDOWN: Locked in 50% profit at {new_stop:.2f} for position {position_id}")
+                                            protected_count += 1
+                                    else:  # mt5.ORDER_TYPE_SELL
+                                        # Lock in at least 50% of profit
+                                        new_stop = entry_price - (profit_points * 0.5 * point)
+                                        if new_stop < position.sl:
+                                            update_position_stops(symbol, position_id, new_stop)
+                                            logging.info(f"SHUTDOWN: Locked in 50% profit at {new_stop:.2f} for position {position_id}")
+                                            protected_count += 1
+                                elif profit_percent > 0.5:  # Small profit
+                                    # At least move to breakeven
+                                    if position_type == mt5.ORDER_TYPE_BUY and position.sl < entry_price:
+                                        update_position_stops(symbol, position_id, entry_price)
+                                        logging.info(f"SHUTDOWN: Moved stop to breakeven for position {position_id}")
+                                        protected_count += 1
+                                    elif position_type == mt5.ORDER_TYPE_SELL and position.sl > entry_price:
+                                        update_position_stops(symbol, position_id, entry_price)
+                                        logging.info(f"SHUTDOWN: Moved stop to breakeven for position {position_id}")
+                                        protected_count += 1
+                    
+                    # 3. NEW: Handle positions in significant loss
+                    # For positions in significant loss, consider closing or setting tight stops
+                    if (position_type == mt5.ORDER_TYPE_BUY and current_price < entry_price * 0.97) or \
+                    (position_type == mt5.ORDER_TYPE_SELL and current_price > entry_price * 1.03):
                         
-            except Exception as e:
-                logging.error(f"SHUTDOWN: Error protecting position {position_id}: {e}")
-                
-        logging.info(f"SHUTDOWN: All positions protected with stop losses ({protected_count} updated)")
-        
-    except Exception as e:
-        logging.error(f"SHUTDOWN: Error during shutdown sequence: {e}")
+                        # Position is in 3%+ loss - consider closing if in volatile market
+                        volatility_level, _ = calculate_market_volatility(symbol, MT5_TIMEFRAMES["PRIMARY"])
+                        
+                        if volatility_level in ["high", "extreme"]:
+                            # Close position in high volatility
+                            close_position(position_id)
+                            logging.warning(f"SHUTDOWN: Closed losing position {position_id} in {volatility_level} volatility")
+                        else:
+                            # Set tight stop to limit further losses
+                            if position_type == mt5.ORDER_TYPE_BUY:
+                                tight_stop = current_price * 0.995  # 0.5% below current
+                            else:  # mt5.ORDER_TYPE_SELL
+                                tight_stop = current_price * 1.005  # 0.5% above current
+                                
+                            # Round to appropriate precision
+                            digits = get_symbol_info(symbol).digits
+                            tight_stop = round(tight_stop, digits)
+                            
+                            update_position_stops(symbol, position_id, tight_stop)
+                            logging.warning(f"SHUTDOWN: Set tight stop at {tight_stop:.2f} for losing position {position_id}")
+                            protected_count += 1
+                            
+                except Exception as e:
+                    logging.error(f"SHUTDOWN: Error protecting position {position_id}: {e}")
+                    
+            logging.info(f"SHUTDOWN: All positions protected with stop losses ({protected_count} updated)")
+            
+        except Exception as e:
+            logging.error(f"SHUTDOWN: Error during shutdown sequence: {e}")
     
     logging.info("SHUTDOWN: Shutdown sequence completed")
 
@@ -9611,6 +9623,55 @@ def place_market_order(symbol, order_type, lot_size, sl, tp, comment=""):
             logging.info(f"Market order placed successfully with STRATEGY 1: {order_type} {symbol} {lot_size} lots at {price}")
             write_trade_notes(f"Opened {order_type} position on {symbol}: {lot_size} lots at {price}, SL: {sl}, TP: {tp}")
             
+            # Add trade data collection and ML dataset saving
+            try:
+                # Collect technical indicators
+                atr = calculate_atr(get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"]))
+                rsi = calculate_rsi(get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"]))
+                macd_signal = 0  # Get your actual MACD value if available
+                ema_diff = 0     # Get your actual EMA difference if available
+                risk_reward = abs(tp - price) / abs(price - sl) if sl != price else 0
+                
+                # Get volatility and regime info
+                volatility_level = calculate_market_volatility(symbol)
+                market_regime, regime_strength = detect_market_regime(symbol)
+                
+                # Get detected patterns
+                detected_patterns = []
+                if hasattr(state, 'current_signals') and symbol in state.current_signals:
+                    signal_data = state.current_signals[symbol]
+                    if "chart_patterns" in signal_data:
+                        pattern_data = signal_data["chart_patterns"]
+                        if pattern_data.get("detected", False):
+                            detected_patterns.append(pattern_data.get("pattern", "unknown"))
+                
+                # Create trade data dictionary
+                trade_data = {
+                    'direction': order_type,
+                    'entry_price': price,
+                    'sl_price': sl,
+                    'tp_price': tp,
+                    'lot_size': lot_size,
+                    'risk_reward': risk_reward,
+                    'volatility': volatility_level,
+                    'market_regime': market_regime,
+                    'regime_strength': regime_strength,
+                    'patterns': detected_patterns,
+                    'atr': atr,
+                    'rsi': rsi,
+                    'macd': macd_signal,
+                    'ema_diff': ema_diff
+                }
+                
+                # Save to ML dataset
+                save_trade_to_ml_dataset(symbol, trade_data)
+                
+                # Add detailed trade log
+                log_trade_details('open', symbol, order_type, lot_size, price, sl, tp, ticket, 
+                               f"Patterns: {', '.join(detected_patterns) if detected_patterns else 'None'}")
+            except Exception as e:
+                logging.error(f"Failed to save trade data for ML: {e}")
+            
             # IMPROVED: More robust position verification with extended attempts
             verified = False
             for verification_attempt in range(5):  # Increased from 3 to 5 attempts
@@ -9669,6 +9730,51 @@ def place_market_order(symbol, order_type, lot_size, sl, tp, comment=""):
                 
             write_trade_notes(f"Opened {order_type} position on {symbol}: {lot_size} lots at {price}, SL: {sl}, TP: {tp}")
             
+            # Add trade data collection and ML dataset saving
+            try:
+                # Collect technical indicators
+                atr = calculate_atr(get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"]))
+                rsi = calculate_rsi(get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"]))
+                macd_signal = 0
+                ema_diff = 0
+                risk_reward = abs(tp - price) / abs(price - sl) if sl != price else 0
+                
+                volatility_level = calculate_market_volatility(symbol)
+                market_regime, regime_strength = detect_market_regime(symbol)
+                
+                detected_patterns = []
+                if hasattr(state, 'current_signals') and symbol in state.current_signals:
+                    signal_data = state.current_signals[symbol]
+                    if "chart_patterns" in signal_data:
+                        pattern_data = signal_data["chart_patterns"]
+                        if pattern_data.get("detected", False):
+                            detected_patterns.append(pattern_data.get("pattern", "unknown"))
+                
+                trade_data = {
+                    'direction': order_type,
+                    'entry_price': price,
+                    'sl_price': sl,
+                    'tp_price': tp,
+                    'lot_size': lot_size,
+                    'risk_reward': risk_reward,
+                    'volatility': volatility_level,
+                    'market_regime': market_regime,
+                    'regime_strength': regime_strength,
+                    'patterns': detected_patterns,
+                    'atr': atr,
+                    'rsi': rsi,
+                    'macd': macd_signal,
+                    'ema_diff': ema_diff
+                }
+                
+                save_trade_to_ml_dataset(symbol, trade_data)
+                
+                # Add detailed trade log
+                log_trade_details('open', symbol, order_type, lot_size, price, sl, tp, ticket, 
+                               f"Patterns: {', '.join(detected_patterns) if detected_patterns else 'None'}")
+            except Exception as e:
+                logging.error(f"Failed to save trade data for ML: {e}")
+            
             # IMPROVED: More robust position verification
             verified = False
             for verification_attempt in range(5):  # Try 5 times
@@ -9710,6 +9816,51 @@ def place_market_order(symbol, order_type, lot_size, sl, tp, comment=""):
                 mt5.order_send(modify_request)
                 write_trade_notes(f"Opened {order_type} position on {symbol}: {lot_size} lots at {price}, SL: {sl}, TP: {tp}")
                 
+                # Add trade data collection and ML dataset saving
+                try:
+                    # Collect technical indicators
+                    atr = calculate_atr(get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"]))
+                    rsi = calculate_rsi(get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"]))
+                    macd_signal = 0
+                    ema_diff = 0
+                    risk_reward = abs(tp - price) / abs(price - sl) if sl != price else 0
+                    
+                    volatility_level = calculate_market_volatility(symbol)
+                    market_regime, regime_strength = detect_market_regime(symbol)
+                    
+                    detected_patterns = []
+                    if hasattr(state, 'current_signals') and symbol in state.current_signals:
+                        signal_data = state.current_signals[symbol]
+                        if "chart_patterns" in signal_data:
+                            pattern_data = signal_data["chart_patterns"]
+                            if pattern_data.get("detected", False):
+                                detected_patterns.append(pattern_data.get("pattern", "unknown"))
+                    
+                    trade_data = {
+                        'direction': order_type,
+                        'entry_price': price,
+                        'sl_price': sl,
+                        'tp_price': tp,
+                        'lot_size': lot_size,
+                        'risk_reward': risk_reward,
+                        'volatility': volatility_level,
+                        'market_regime': market_regime,
+                        'regime_strength': regime_strength,
+                        'patterns': detected_patterns,
+                        'atr': atr,
+                        'rsi': rsi,
+                        'macd': macd_signal,
+                        'ema_diff': ema_diff
+                    }
+                    
+                    save_trade_to_ml_dataset(symbol, trade_data)
+                    
+                    # Add detailed trade log
+                    log_trade_details('open', symbol, order_type, lot_size, price, sl, tp, ticket, 
+                                   f"Patterns: {', '.join(detected_patterns) if detected_patterns else 'None'}")
+                except Exception as e:
+                    logging.error(f"Failed to save trade data for ML: {e}")
+                
                 # IMPROVED: Verify position was created with multiple attempts
                 verified = False
                 for verification_attempt in range(5):  # Try 5 times
@@ -9740,6 +9891,51 @@ def place_market_order(symbol, order_type, lot_size, sl, tp, comment=""):
             ticket = result.order
             logging.info(f"Market order placed successfully with STRATEGY 4: {order_type} {symbol} {lot_size} lots at {price}")
             write_trade_notes(f"Opened {order_type} position on {symbol}: {lot_size} lots at {price}, SL: {sl}, TP: {tp}")
+            
+            # Add trade data collection and ML dataset saving
+            try:
+                # Collect technical indicators
+                atr = calculate_atr(get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"]))
+                rsi = calculate_rsi(get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"]))
+                macd_signal = 0
+                ema_diff = 0
+                risk_reward = abs(tp - price) / abs(price - sl) if sl != price else 0
+                
+                volatility_level = calculate_market_volatility(symbol)
+                market_regime, regime_strength = detect_market_regime(symbol)
+                
+                detected_patterns = []
+                if hasattr(state, 'current_signals') and symbol in state.current_signals:
+                    signal_data = state.current_signals[symbol]
+                    if "chart_patterns" in signal_data:
+                        pattern_data = signal_data["chart_patterns"]
+                        if pattern_data.get("detected", False):
+                            detected_patterns.append(pattern_data.get("pattern", "unknown"))
+                
+                trade_data = {
+                    'direction': order_type,
+                    'entry_price': price,
+                    'sl_price': sl,
+                    'tp_price': tp,
+                    'lot_size': lot_size,
+                    'risk_reward': risk_reward,
+                    'volatility': volatility_level,
+                    'market_regime': market_regime,
+                    'regime_strength': regime_strength,
+                    'patterns': detected_patterns,
+                    'atr': atr,
+                    'rsi': rsi,
+                    'macd': macd_signal,
+                    'ema_diff': ema_diff
+                }
+                
+                save_trade_to_ml_dataset(symbol, trade_data)
+                
+                # Add detailed trade log
+                log_trade_details('open', symbol, order_type, lot_size, price, sl, tp, ticket, 
+                               f"Patterns: {', '.join(detected_patterns) if detected_patterns else 'None'}")
+            except Exception as e:
+                logging.error(f"Failed to save trade data for ML: {e}")
             
             # IMPROVED: Verify position was created with multiple attempts
             verified = False
@@ -9793,6 +9989,51 @@ def place_market_order(symbol, order_type, lot_size, sl, tp, comment=""):
             logging.info(f"Pending order placed successfully with STRATEGY 5: {order_type} {symbol} {lot_size} lots at {limit_price}")
             write_trade_notes(f"Opened pending {order_type} on {symbol}: {lot_size} lots at {limit_price}, SL: {sl}, TP: {tp}")
             
+            # Add trade data collection and ML dataset saving
+            try:
+                # Collect technical indicators
+                atr = calculate_atr(get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"]))
+                rsi = calculate_rsi(get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"]))
+                macd_signal = 0
+                ema_diff = 0
+                risk_reward = abs(tp - limit_price) / abs(limit_price - sl) if sl != limit_price else 0
+                
+                volatility_level = calculate_market_volatility(symbol)
+                market_regime, regime_strength = detect_market_regime(symbol)
+                
+                detected_patterns = []
+                if hasattr(state, 'current_signals') and symbol in state.current_signals:
+                    signal_data = state.current_signals[symbol]
+                    if "chart_patterns" in signal_data:
+                        pattern_data = signal_data["chart_patterns"]
+                        if pattern_data.get("detected", False):
+                            detected_patterns.append(pattern_data.get("pattern", "unknown"))
+                
+                trade_data = {
+                    'direction': order_type,
+                    'entry_price': limit_price,
+                    'sl_price': sl,
+                    'tp_price': tp,
+                    'lot_size': lot_size,
+                    'risk_reward': risk_reward,
+                    'volatility': volatility_level,
+                    'market_regime': market_regime,
+                    'regime_strength': regime_strength,
+                    'patterns': detected_patterns,
+                    'atr': atr,
+                    'rsi': rsi,
+                    'macd': macd_signal,
+                    'ema_diff': ema_diff
+                }
+                
+                save_trade_to_ml_dataset(symbol, trade_data)
+                
+                # Add detailed trade log for pending order
+                log_trade_details('pending', symbol, order_type, lot_size, limit_price, sl, tp, ticket, 
+                               f"Patterns: {', '.join(detected_patterns) if detected_patterns else 'None'}")
+            except Exception as e:
+                logging.error(f"Failed to save trade data for ML: {e}")
+            
             # IMPROVED: Verify order was created with multiple attempts
             verified = False
             for verification_attempt in range(5):
@@ -9827,7 +10068,7 @@ def place_market_order(symbol, order_type, lot_size, sl, tp, comment=""):
                 logging.info(f"place_market_order - Market order placed successfully with STRATEGY 6: {order_type} {symbol} {lot_size} lots at {price}")
                 write_trade_notes(f"Opened {order_type} position on {symbol}: {lot_size} lots at {price}, SL: {sl}, TP: {tp}")
 
-                # ADD THE FOLLOWING CODE RIGHT HERE:
+                # Add trade data collection and ML dataset saving
                 try:
                     # Collect technical indicators
                     atr = calculate_atr(get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"]))
@@ -9869,6 +10110,10 @@ def place_market_order(symbol, order_type, lot_size, sl, tp, comment=""):
                     
                     # Save to ML dataset
                     save_trade_to_ml_dataset(symbol, trade_data)
+                    
+                    # Add detailed trade log
+                    log_trade_details('open', symbol, order_type, lot_size, price, sl, tp, order_ticket, 
+                                   f"Patterns: {', '.join(detected_patterns) if detected_patterns else 'None'}")
                 except Exception as e:
                     logging.error(f"Failed to save trade data for ML: {e}")
 
@@ -9888,8 +10133,6 @@ def place_market_order(symbol, order_type, lot_size, sl, tp, comment=""):
                     modify_result = mt5.order_send(modify_request)
                     if modify_result and modify_result.retcode == mt5.TRADE_RETCODE_DONE:
                         logging.info(f"place_market_order - Successfully added SL/TP to position {position_ticket}")
-                        # KEEP YOUR EXISTING write_trade_notes CALL HERE
-                        write_trade_notes(f"Opened {order_type} position on {symbol}: {lot_size} lots at {price}, SL: {sl}, TP: {tp}")
                         break
                     else:
                         logging.warning(f"place_market_order - Failed to add SL/TP on attempt {modify_attempt}: {modify_result.retcode if modify_result else 'Unknown error'}")
@@ -9908,7 +10151,6 @@ def place_market_order(symbol, order_type, lot_size, sl, tp, comment=""):
                 time.sleep(0.3)  # Short delay before retry
 
         return None  # Return None if all attempts fail
-
 
         # STRATEGY 7: Try with market order type
         market_request = {
@@ -9941,6 +10183,51 @@ def place_market_order(symbol, order_type, lot_size, sl, tp, comment=""):
             mt5.order_send(modify_request)
             write_trade_notes(f"Opened {order_type} position on {symbol}: {lot_size} lots at {price}, SL: {sl}, TP: {tp}")
             
+            # Add trade data collection and ML dataset saving
+            try:
+                # Collect technical indicators
+                atr = calculate_atr(get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"]))
+                rsi = calculate_rsi(get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"]))
+                macd_signal = 0
+                ema_diff = 0
+                risk_reward = abs(tp - price) / abs(price - sl) if sl != price else 0
+                
+                volatility_level = calculate_market_volatility(symbol)
+                market_regime, regime_strength = detect_market_regime(symbol)
+                
+                detected_patterns = []
+                if hasattr(state, 'current_signals') and symbol in state.current_signals:
+                    signal_data = state.current_signals[symbol]
+                    if "chart_patterns" in signal_data:
+                        pattern_data = signal_data["chart_patterns"]
+                        if pattern_data.get("detected", False):
+                            detected_patterns.append(pattern_data.get("pattern", "unknown"))
+                
+                trade_data = {
+                    'direction': order_type,
+                    'entry_price': price,
+                    'sl_price': sl,
+                    'tp_price': tp,
+                    'lot_size': lot_size,
+                    'risk_reward': risk_reward,
+                    'volatility': volatility_level,
+                    'market_regime': market_regime,
+                    'regime_strength': regime_strength,
+                    'patterns': detected_patterns,
+                    'atr': atr,
+                    'rsi': rsi,
+                    'macd': macd_signal,
+                    'ema_diff': ema_diff
+                }
+                
+                save_trade_to_ml_dataset(symbol, trade_data)
+                
+                # Add detailed trade log
+                log_trade_details('open', symbol, order_type, lot_size, price, sl, tp, ticket, 
+                               f"Patterns: {', '.join(detected_patterns) if detected_patterns else 'None'}")
+            except Exception as e:
+                logging.error(f"Failed to save trade data for ML: {e}")
+            
             # IMPROVED: Verify position was created with multiple attempts
             verified = False
             for verification_attempt in range(5):
@@ -9968,7 +10255,7 @@ def place_market_order(symbol, order_type, lot_size, sl, tp, comment=""):
         logging.error(f"Error placing market order: {e}")
         logging.error(traceback.format_exc())
         return None
-
+    
 def verify_position_sl_tp(position_ticket, expected_sl, expected_tp, max_attempts=5):
     """Verify that a position has the correct SL/TP values"""
     for attempt in range(1, max_attempts + 1):
