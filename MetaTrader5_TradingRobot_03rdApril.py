@@ -5,9 +5,11 @@ import time
 import logging
 import talib
 import math
+import csv
 import os
 import requests
 from datetime import datetime, timezone, timedelta
+import pickle
 import configparser
 import json
 import traceback
@@ -17,7 +19,9 @@ import base64
 import threading
 import queue
 import sys
+import signal
 import random
+from sklearn.ensemble import RandomForestClassifier
 
 class TradingBotLogFilter(logging.Filter):
     """Enhanced filter to aggressively reduce repetitive log messages"""
@@ -329,6 +333,89 @@ LOG_FILE = "trading_bot.log"
 # ======================================================
 # LOGGING SETUP
 # ======================================================
+def log_trade_details(action, symbol, order_type, lot_size, entry_price, sl, tp, ticket=None, additional_info=None):
+    """Centralized function for logging trade details in a standardized format"""
+    if action.lower() == 'open':
+        msg = f"🔶 OPENED {order_type} {symbol} position: {lot_size} lots @ {entry_price}"
+    elif action.lower() == 'close':
+        msg = f"🔷 CLOSED {order_type} {symbol} position: {lot_size} lots @ {entry_price}"
+    elif action.lower() == 'modify':
+        msg = f"📊 MODIFIED {order_type} {symbol} position: Updated SL/TP"
+    else:
+        msg = f"ℹ️ TRADE EVENT {action}: {order_type} {symbol} position: {lot_size} lots @ {entry_price}"
+    
+    # Add SL/TP info
+    if sl and tp:
+        risk_pts = abs(entry_price - sl)
+        reward_pts = abs(tp - entry_price)
+        rr_ratio = reward_pts / risk_pts if risk_pts > 0 else 0
+        
+        msg += f" | SL: {sl} ({risk_pts:.2f} pts)"
+        msg += f" | TP: {tp} ({reward_pts:.2f} pts)"
+        msg += f" | R:R = 1:{rr_ratio:.2f}"
+    
+    # Add ticket if available
+    if ticket:
+        msg += f" | Ticket: {ticket}"
+    
+    # Add any additional info
+    if additional_info:
+        msg += f" | {additional_info}"
+    
+    # Log at warning level to ensure visibility
+    logging.warning(msg)
+    
+    # Also log to special trades log
+    with open("trades.log", "a") as f:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        f.write(f"{timestamp} - {msg}\n")
+
+# Application-wide log filter
+def setup_advanced_logging():
+    # Create console handler with a higher log level
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    
+    # Add the new buffered filter
+    log_filter = BufferedLogFilter()
+    console.addFilter(log_filter)
+    
+    # Apply formatted output
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(funcName)s - %(message)s')
+    console.setFormatter(formatter)
+    
+    # Apply to root logger
+    root_logger = logging.getLogger()
+
+    # Add the new filter to existing handlers
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.StreamHandler):  # Only for console output
+            handler.addFilter(BufferedLogFilter())
+    
+    # Remove any existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Add the new filtered handler
+    root_logger.addHandler(console)
+    
+    # Add rotating file handler for full logs
+    file_handler = logging.handlers.RotatingFileHandler(
+        'trading_bot_full.log', maxBytes=5*1024*1024, backupCount=5
+    )
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+    
+    # Add specific trade log file
+    trade_handler = logging.handlers.RotatingFileHandler(
+        'trades_only.log', maxBytes=2*1024*1024, backupCount=5
+    )
+    trade_handler.setFormatter(formatter)
+    trade_handler.setLevel(logging.INFO)
+    trade_handler.addFilter(lambda record: any(p in record.getMessage() for p in ["position opened", "position closed", "order placed", "Updated SL/TP"]))
+    root_logger.addHandler(trade_handler)
+    
+    return log_filter
 
 # Configure logging
 log_level = getattr(logging, LOG_LEVEL.upper(), logging.INFO)
@@ -623,7 +710,456 @@ def create_performance_chart():
 # ======================================================
 # NEW HELPER FUNCTIONS FOR IMPLEMENTATION
 # ======================================================
+def get_current_market_features(symbol):
+    """Extract current market features for ML prediction"""
+    try:
+        # Get candle data for different timeframes
+        df_primary = get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"])
+        df_secondary = get_candle_data(symbol, MT5_TIMEFRAMES["SECONDARY"])
+        
+        if df_primary is None or df_secondary is None:
+            return None
+            
+        # Calculate technical indicators
+        features = {}
+        
+        # Price-based features
+        features['close'] = df_primary['close'].iloc[-1]
+        features['open'] = df_primary['open'].iloc[-1]
+        features['high'] = df_primary['high'].iloc[-1]
+        features['low'] = df_primary['low'].iloc[-1]
+        
+        # Calculate basic indicators
+        features['atr'] = calculate_atr(df_primary)
+        features['rsi'] = calculate_rsi(df_primary)
+        features['atr_percent'] = features['atr'] / features['close'] * 100
+        
+        # Calculate moving averages
+        for period in [20, 50, 100, 200]:
+            if len(df_primary) >= period:
+                features[f'sma_{period}'] = df_primary['close'].rolling(period).mean().iloc[-1]
+                features[f'sma_{period}_diff'] = (features['close'] / features[f'sma_{period}'] - 1) * 100
+        
+        # Volatility metrics
+        features['volatility_level'] = volatility_level_to_numeric(calculate_market_volatility(symbol))
+        
+        # Market regime
+        market_regime, regime_strength = detect_market_regime(symbol)
+        features['market_regime'] = market_regime_to_numeric(market_regime)
+        features['regime_strength'] = regime_strength
+        
+        # Pattern detection (categorical)
+        features['has_pattern'] = 0
+        if hasattr(state, 'current_signals') and symbol in state.current_signals:
+            signal_data = state.current_signals[symbol]
+            if "chart_patterns" in signal_data:
+                pattern_data = signal_data["chart_patterns"]
+                features['has_pattern'] = 1 if pattern_data.get("detected", False) else 0
+                features['pattern_reliability'] = pattern_data.get("reliability", 0)
+        
+        return features
+        
+    except Exception as e:
+        logging.error(f"Error getting market features: {e}")
+        return None
 
+def volatility_level_to_numeric(level):
+    """Convert volatility level to numeric value for ML"""
+    mapping = {
+        "low": 0,
+        "normal": 1,
+        "high": 2,
+        "extreme": 3,
+        "super-extreme": 4
+    }
+    return mapping.get(level, 1)  # Default to normal
+
+def market_regime_to_numeric(regime):
+    """Convert market regime to numeric value for ML"""
+    mapping = {
+        "STRONG_UPTREND": 4,
+        "UPTREND": 3,
+        "RANGE_BOUND": 2,
+        "DOWNTREND": 1,
+        "STRONG_DOWNTREND": 0,
+        "VOLATILITY_EXPANSION": 5,
+        "VOLATILITY_COMPRESSION": 6,
+        "UNDEFINED": 7,
+        "CHOPPY_VOLATILE": 8
+    }
+    return mapping.get(regime, 7)  # Default to UNDEFINED
+
+def calculate_dynamic_lot_size(symbol, order_type, entry_price, stop_loss, take_profit, base_risk_percent=0.75, max_risk_percent=3.0):
+    """
+    Calculate dynamic lot size based on both risk and profit potential.
+    Scales up lot size when profit probability and potential are high.
+    """
+    try:
+        # First calculate the base lot size using standard risk
+        base_lot = calculate_risk_adjusted_lot_size(symbol, order_type, entry_price, stop_loss, base_risk_percent)
+        
+        # Calculate risk:reward ratio
+        risk_points = abs(entry_price - stop_loss)
+        reward_points = abs(take_profit - entry_price)
+        rr_ratio = reward_points / risk_points if risk_points > 0 else 0
+        
+        # Get market conditions
+        market_regime, regime_strength = detect_market_regime(symbol)
+        volatility_level = calculate_market_volatility(symbol)
+        
+        # Get ML prediction if available
+        ml_prediction = 0.5  # Default 50% probability
+        if hasattr(state, 'ml_models') and symbol in state.ml_models:
+            # Get market features
+            features = get_current_market_features(symbol)
+            if features is not None:
+                try:
+                    ml_prediction = state.ml_models[symbol].predict_proba([features])[0][1]
+                except:
+                    pass
+        
+        # Base lot size multiplier
+        lot_multiplier = 1.0
+        
+        # Adjust based on risk:reward ratio
+        if rr_ratio >= 3.0:
+            lot_multiplier *= 1.5
+            logging.info(f"Increasing lot size by 50% due to excellent R:R ratio of {rr_ratio}")
+        elif rr_ratio >= 2.0:
+            lot_multiplier *= 1.2
+            logging.info(f"Increasing lot size by 20% due to good R:R ratio of {rr_ratio}")
+        
+        # Adjust based on ML prediction
+        if ml_prediction >= 0.8:
+            lot_multiplier *= 1.5
+            logging.info(f"Increasing lot size by 50% due to strong ML prediction ({ml_prediction:.2f})")
+        elif ml_prediction >= 0.65:
+            lot_multiplier *= 1.2
+            logging.info(f"Increasing lot size by 20% due to positive ML prediction ({ml_prediction:.2f})")
+        elif ml_prediction <= 0.3:
+            lot_multiplier *= 0.7
+            logging.info(f"Decreasing lot size by 30% due to negative ML prediction ({ml_prediction:.2f})")
+        
+        # Adjust based on market conditions
+        if market_regime in ["STRONG_UPTREND", "STRONG_DOWNTREND"] and regime_strength > 0.7:
+            if (market_regime == "STRONG_UPTREND" and order_type == "BUY") or \
+               (market_regime == "STRONG_DOWNTREND" and order_type == "SELL"):
+                lot_multiplier *= 1.3
+                logging.info(f"Increasing lot size by 30% due to alignment with {market_regime}")
+        
+        # Reduce in high volatility conditions
+        if volatility_level in ["extreme", "super-extreme"]:
+            lot_multiplier *= 0.8
+            logging.info(f"Reducing lot size by 20% due to {volatility_level} volatility")
+        
+        # Check consecutive wins/losses
+        if hasattr(state, 'trade_results') and len(state.trade_results.get(symbol, [])) >= 3:
+            recent_results = state.trade_results[symbol][-3:]
+            if all(result == 'win' for result in recent_results):
+                lot_multiplier *= 1.2
+                logging.info(f"Increasing lot size by 20% due to 3 consecutive wins")
+            elif all(result == 'loss' for result in recent_results):
+                lot_multiplier *= 0.7
+                logging.info(f"Decreasing lot size by 30% due to 3 consecutive losses")
+        
+        # Calculate adjusted lot size
+        adjusted_lot = base_lot * lot_multiplier
+        
+        # Get symbol info for lot constraints
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info:
+            # Round to symbol's lot step
+            lot_step = symbol_info.volume_step
+            adjusted_lot = round(adjusted_lot / lot_step) * lot_step
+            
+            # Ensure within symbol's limits
+            min_lot = symbol_info.volume_min
+            max_lot = symbol_info.volume_max
+            adjusted_lot = max(min_lot, min(adjusted_lot, max_lot))
+        
+        # Calculate the risk percentage this represents
+        account_info = mt5.account_info()
+        if account_info:
+            equity = account_info.equity
+            position_value = adjusted_lot * risk_points
+            actual_risk_percent = (position_value / equity) * 100
+            
+            # Cap at maximum risk percentage
+            if actual_risk_percent > max_risk_percent:
+                logging.warning(f"Dynamic lot size would risk {actual_risk_percent:.2f}%, capping at {max_risk_percent}%")
+                adjusted_lot = (max_risk_percent / 100) * equity / risk_points
+                adjusted_lot = round(adjusted_lot / lot_step) * lot_step
+        
+        logging.info(f"Dynamic lot size calculation: Base: {base_lot}, Multiplier: {lot_multiplier}, Final: {adjusted_lot}")
+        return adjusted_lot
+        
+    except Exception as e:
+        logging.error(f"Error calculating dynamic lot size: {e}")
+        # Fallback to standard calculation
+        return calculate_risk_adjusted_lot_size(symbol, order_type, entry_price, stop_loss, base_risk_percent)
+
+def calculate_adaptive_tsl_parameters(symbol, position_type, entry_price, current_price, profit_percent):
+    """Calculate adaptive trailing stop loss parameters based on market conditions and profit"""
+    try:
+        # Get market data
+        volatility_level = calculate_market_volatility(symbol)
+        market_regime, regime_strength = detect_market_regime(symbol)
+        
+        # Base TSL activation threshold (% profit needed to activate TSL)
+        base_activation = 0.5  # 0.5% profit
+        
+        # Base trailing distance (% of price)
+        base_trailing_distance = 0.3  # 0.3% distance
+        
+        # Adjust based on volatility
+        volatility_adjustment = {
+            "low": 0.7,        # Tighter in low volatility
+            "normal": 1.0,     # Normal distance
+            "high": 1.3,       # Wider in high volatility
+            "extreme": 1.6,    # Much wider in extreme volatility
+            "super-extreme": 2.0  # Very wide in super-extreme volatility
+        }
+        
+        vol_factor = volatility_adjustment.get(volatility_level, 1.0)
+        
+        # Adjust based on market regime
+        regime_adjustment = {
+            "STRONG_UPTREND": 0.8 if position_type == mt5.POSITION_TYPE_BUY else 1.2,
+            "STRONG_DOWNTREND": 1.2 if position_type == mt5.POSITION_TYPE_BUY else 0.8,
+            "RANGE_BOUND": 0.9,  # Tighter in range markets
+            "VOLATILITY_EXPANSION": 1.4,  # Wider in expanding volatility
+            "VOLATILITY_COMPRESSION": 0.8,  # Tighter in compressed volatility
+            "UNDEFINED": 1.0  # Default
+        }
+        
+        regime_factor = regime_adjustment.get(market_regime, 1.0)
+        
+        # Adjust activation threshold
+        activation_threshold = base_activation * vol_factor
+        
+        # Adjust trailing distance
+        trailing_distance = base_trailing_distance * vol_factor * regime_factor
+        
+        # Progressive TSL - tighten as profit increases
+        if profit_percent > 3.0:
+            trailing_distance *= 0.7
+            logging.info(f"Tightening TSL by 30% due to large profit ({profit_percent:.2f}%)")
+        elif profit_percent > 1.5:
+            trailing_distance *= 0.85
+            logging.info(f"Tightening TSL by 15% due to good profit ({profit_percent:.2f}%)")
+        
+        # Calculate TSL price
+        if position_type == mt5.POSITION_TYPE_BUY:
+            tsl_price = current_price * (1 - trailing_distance/100)
+        else:
+            tsl_price = current_price * (1 + trailing_distance/100)
+        
+        return {
+            'activation_threshold': activation_threshold,
+            'trailing_distance': trailing_distance,
+            'tsl_price': tsl_price
+        }
+        
+    except Exception as e:
+        logging.error(f"Error calculating adaptive TSL parameters: {e}")
+        # Return default values
+        default_tsl_price = current_price * 0.997 if position_type == mt5.POSITION_TYPE_BUY else current_price * 1.003
+        return {
+            'activation_threshold': 0.5,
+            'trailing_distance': 0.3,
+            'tsl_price': default_tsl_price
+        }
+
+def manage_trailing_stop_loss(position):
+    """Enhanced TSL management for a single position"""
+    try:
+        symbol = position.symbol
+        position_type = position.type
+        position_id = position.ticket
+        entry_price = position.price_open
+        current_price = position.price_current
+        current_sl = position.sl
+        
+        # Calculate profit percentage
+        if position_type == mt5.POSITION_TYPE_BUY:
+            profit_points = current_price - entry_price
+            profit_percent = (profit_points / entry_price) * 100
+        else:
+            profit_points = entry_price - current_price
+            profit_percent = (profit_points / entry_price) * 100
+        
+        # Get adaptive TSL parameters
+        tsl_params = calculate_adaptive_tsl_parameters(
+            symbol, position_type, entry_price, current_price, profit_percent
+        )
+        
+        activation_threshold = tsl_params['activation_threshold']
+        trailing_distance = tsl_params['trailing_distance']
+        calculated_tsl = tsl_params['tsl_price']
+        
+        # If profit meets activation threshold
+        if profit_percent >= activation_threshold:
+            # Round to symbol's precision
+            symbol_info = mt5.symbol_info(symbol)
+            if symbol_info:
+                digits = symbol_info.digits
+                calculated_tsl = round(calculated_tsl, digits)
+            
+            # Compare with current SL
+            should_update = False
+            
+            if position_type == mt5.POSITION_TYPE_BUY:
+                if current_sl is None or calculated_tsl > current_sl:
+                    should_update = True
+            else:  # SELL
+                if current_sl is None or calculated_tsl < current_sl:
+                    should_update = True
+            
+            # Update if needed
+            if should_update:
+                request = {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": position_id,
+                    "sl": calculated_tsl,
+                    # Keep existing TP
+                    "tp": position.tp
+                }
+                
+                result = mt5.order_send(request)
+                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                    logging.info(f"Updated TSL for {symbol} position {position_id}: New SL={calculated_tsl}, Profit={profit_percent:.2f}%, Distance={trailing_distance:.2f}%")
+                    return True
+                else:
+                    logging.error(f"Failed to update TSL for {symbol} position {position_id}: {result.retcode if result else 'Unknown error'}")
+                    return False
+            
+        return False
+        
+    except Exception as e:
+        logging.error(f"Error managing trailing stop loss: {e}")
+        return False
+
+def save_trade_to_ml_dataset(symbol, trade_data, outcome=None):
+    """Save trade data to ML dataset for future training"""
+    try:
+        # Create directory if it doesn't exist
+        os.makedirs("ml_data", exist_ok=True)
+        
+        # Prepare file path
+        file_path = f"ml_data/{symbol}_trades.csv"
+        
+        # Check if file exists
+        file_exists = os.path.isfile(file_path)
+        
+        # Prepare data row
+        data_row = {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'symbol': symbol,
+            'direction': trade_data.get('direction', 'unknown'),
+            'entry_price': trade_data.get('entry_price', 0),
+            'sl_price': trade_data.get('sl_price', 0),
+            'tp_price': trade_data.get('tp_price', 0),
+            'lot_size': trade_data.get('lot_size', 0),
+            'risk_reward': trade_data.get('risk_reward', 0),
+            'volatility': trade_data.get('volatility', 'unknown'),
+            'market_regime': trade_data.get('market_regime', 'unknown'),
+            'regime_strength': trade_data.get('regime_strength', 0),
+            'patterns': str(trade_data.get('patterns', [])),
+            'outcome': outcome if outcome else 'pending'
+        }
+        
+        # Add market metrics
+        for metric in ['atr', 'rsi', 'macd', 'ema_diff']:
+            if metric in trade_data:
+                data_row[metric] = trade_data[metric]
+        
+        # Open file in append mode
+        with open(file_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=list(data_row.keys()))
+            
+            # Write header if file is new
+            if not file_exists:
+                writer.writeheader()
+            
+            # Write data row
+            writer.writerow(data_row)
+            
+        logging.info(f"Trade data saved to ML dataset for {symbol}")
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error saving trade data to ML dataset: {e}")
+        return False
+
+def update_ml_models_with_new_data():
+    """Periodically update ML models with new trade data"""
+    try:
+        ml_data_dir = "ml_data"
+        model_dir = "ml_models"
+        
+        # Ensure directories exist
+        os.makedirs(ml_data_dir, exist_ok=True)
+        os.makedirs(model_dir, exist_ok=True)
+        
+        # Check for data files
+        data_files = [f for f in os.listdir(ml_data_dir) if f.endswith('_trades.csv')]
+        
+        if not data_files:
+            logging.info("No trade data files found for ML model update")
+            return False
+        
+        models_updated = 0
+        
+        for data_file in data_files:
+            symbol = data_file.split('_trades.csv')[0]
+            data_path = os.path.join(ml_data_dir, data_file)
+            model_path = os.path.join(model_dir, f"{symbol}_model.pkl")
+            
+            # Check if we have enough data
+            df = pd.read_csv(data_path)
+            
+            # Only use completed trades for training
+            df = df[df['outcome'] != 'pending']
+            
+            if len(df) < 20:  # Need reasonable amount of data
+                logging.info(f"Not enough completed trade data for {symbol} ML model update ({len(df)} trades)")
+                continue
+            
+            # Prepare features and target
+            features = df.drop(['timestamp', 'symbol', 'outcome', 'patterns'], axis=1, errors='ignore')
+            
+            # Convert categorical variables
+            for col in features.select_dtypes(include=['object']).columns:
+                features[col] = features[col].astype('category').cat.codes
+            
+            # Create target variable (1 for profit, 0 for loss)
+            target = (df['outcome'] == 'profit').astype(int)
+            
+            # Handle NaN values
+            features = features.fillna(0)
+            
+            # Create and train model
+            model = RandomForestClassifier(n_estimators=100, random_state=42)
+            model.fit(features, target)
+            
+            # Save the model
+            with open(model_path, 'wb') as f:
+                pickle.dump(model, f)
+            
+            models_updated += 1
+            logging.info(f"ML model updated for {symbol} using {len(df)} completed trades")
+        
+        if models_updated > 0:
+            logging.info(f"Updated {models_updated} ML models with new trade data")
+            return True
+        else:
+            logging.info("No ML models were updated")
+            return False
+            
+    except Exception as e:
+        logging.error(f"Error updating ML models: {e}")
+        return False
+    
 def get_optimal_entry_price(symbol, signal):
     """
     Calculate an optimal entry price based on current market conditions.
@@ -1915,19 +2451,28 @@ def get_min_lot_size(symbol):
     if symbol_info:
         return symbol_info.volume_min
     return 0.01  # Default minimum
+
 def signal_handler(sig, frame):
-    logging.warning(f"Received {signal.Signals(sig).name}, initiating graceful shutdown")
-    
+    """Handle shutdown signals (CTRL+C)"""
     try:
-        # Only prompt for input if not running in non-interactive mode
-        if sys.stdout.isatty():  # Check if running in interactive terminal
-            response = input("\nDo you want to close all open positions? (y/n, 10s to answer, default: n): ")
-            close_positions = response.lower() in ('y', 'yes')
-        else:
-            close_positions = False
-    except:
-        # If any error occurs during input, default to protecting with stops
-        close_positions = False
+        signal_name = "UNKNOWN"
+        if hasattr(signal, 'Signals') and isinstance(sig, int):
+            try:
+                signal_name = signal.Signals(sig).name
+            except ValueError:
+                signal_name = f"SIGNAL_{sig}"
+        
+        logging.warning(f"Received {signal_name}, initiating emergency position closure")
+        improved_shutdown_handler(close_all_positions=True)
+        
+        # Call original handlers for compatibility
+        if hasattr(sys, 'exitfunc'):
+            sys.exitfunc()
+        
+        sys.exit(0)
+    except Exception as e:
+        logging.critical(f"Critical error during shutdown: {e}")
+        sys.exit(1)
         
     # Call our new improved handler first
     improved_shutdown_handler(close_positions)
@@ -1938,99 +2483,91 @@ def signal_handler(sig, frame):
     
     sys.exit(0)
 
-def improved_shutdown_handler(close_positions=False):
-    """Enhanced shutdown handler with option to close all positions"""
-    logging.info("IMPROVED SHUTDOWN SEQUENCE INITIATED")
+def improved_shutdown_handler(close_all_positions=True):
+    """Enhanced shutdown handler with forced position closure"""
+    logging.warning("IMPROVED SHUTDOWN SEQUENCE INITIATED")
     
     # Get all open positions
     positions = mt5.positions_get()
     if positions is None or len(positions) == 0:
         logging.info("No positions to manage during shutdown")
-        logging.info("SHUTDOWN: Improved shutdown sequence completed")
+        logging.info("SHUTDOWN: Shutdown sequence completed")
         return
     
     position_count = len(positions)
-    logging.info(f"Managing {position_count} open positions during shutdown")
+    logging.warning(f"Managing {position_count} open positions during shutdown")
     
-    if close_positions:
-        # Close all positions
+    if close_all_positions:
+        # Close all positions with retry logic
         closed_count = 0
-        for position in positions:
-            # Prepare close request
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "position": position.ticket,
-                "symbol": position.symbol,
-                "volume": position.volume,
-                "type": mt5.ORDER_TYPE_SELL if position.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY,
-                "price": mt5.symbol_info_tick(position.symbol).bid if position.type == mt5.POSITION_TYPE_BUY else mt5.symbol_info_tick(position.symbol).ask,
-                "deviation": 50,
-                "magic": position.magic,
-                "comment": "close on shutdown",
-                "type_time": mt5.ORDER_TIME_GTC,
-            }
-            
-            # Try up to 3 times
-            for attempt in range(1, 4):
-                result = mt5.order_send(request)
-                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logging.info(f"SHUTDOWN: Closed position {position.ticket} {position.symbol}")
-                    # KEEP YOUR EXISTING write_trade_notes CALL HERE IF APPLICABLE
-                    write_trade_notes(f"Closed {position.symbol} position on shutdown")
-                    closed_count += 1
-                    break
-                else:
-                    logging.warning(f"SHUTDOWN: Failed to close position {position.ticket} on attempt {attempt}: {result.retcode if result else 'Unknown error'}")
-                    time.sleep(0.3)  # Wait before retry
+        position_details = []
         
-        logging.info(f"SHUTDOWN: Closed {closed_count}/{position_count} positions during shutdown")
-    else:
-        # Tighten stops for risk management
-        updated_count = 0
         for position in positions:
-            # Get current price
-            symbol = position.symbol
-            price_info = mt5.symbol_info_tick(symbol)
-            if price_info is None:
-                continue
+            position_details.append({
+                'ticket': position.ticket,
+                'symbol': position.symbol,
+                'type': "BUY" if position.type == mt5.POSITION_TYPE_BUY else "SELL",
+                'volume': position.volume,
+                'open_price': position.price_open,
+                'current_price': position.price_current,
+                'profit': position.profit
+            })
+        
+        # Log position details before closing
+        logging.warning(f"Positions before shutdown: {position_details}")
+        
+        for position in positions:
+            success = False
+            for attempt in range(3):  # Try 3 times to close each position
+                # Prepare close request - important to get the current price again
+                price = mt5.symbol_info_tick(position.symbol).bid if position.type == mt5.POSITION_TYPE_BUY else mt5.symbol_info_tick(position.symbol).ask
                 
-            current_price = price_info.bid if position.type == mt5.POSITION_TYPE_BUY else price_info.ask
-            
-            # Calculate safe stop loss (closer to current price for protection)
-            if position.type == mt5.POSITION_TYPE_BUY:
-                # For buy positions, move stop loss to 1.2% below current price, unless original SL is tighter
-                new_sl = current_price * 0.988  # Slightly tighter than original 0.995
-                if position.sl is not None and position.sl > new_sl:
-                    new_sl = position.sl  # Keep original SL if it's tighter
-            else:
-                # For sell positions, move stop loss to 1.2% above current price, unless original SL is tighter
-                new_sl = current_price * 1.012  # Slightly tighter than original 1.005
-                if position.sl is not None and position.sl < new_sl:
-                    new_sl = position.sl  # Keep original SL if it's tighter
-            
-            # Update the position's stop loss
-            request = {
-                "action": mt5.TRADE_ACTION_SLTP,
-                "position": position.ticket,
-                "sl": new_sl,
-                "tp": position.tp  # Keep original TP
-            }
-            
-            # Try up to 3 times
-            for attempt in range(1, 4):
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": position.symbol,
+                    "volume": position.volume,
+                    "type": mt5.ORDER_TYPE_SELL if position.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+                    "position": position.ticket,
+                    "price": price,
+                    "deviation": 100,  # Increased deviation to ensure execution
+                    "magic": position.magic,
+                    "comment": "closed on shutdown",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": mt5.ORDER_FILLING_FOK
+                }
+                
+                # Send the request
                 result = mt5.order_send(request)
                 if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logging.info(f"SHUTDOWN: Updated SL for position {position.ticket} to {new_sl}")
-                    write_trade_notes(f"Updated SL for {position.symbol} to {new_sl} on shutdown")
-                    updated_count += 1
+                    logging.warning(f"SHUTDOWN: Successfully closed position {position.ticket} {position.symbol}")
+                    closed_count += 1
+                    success = True
                     break
                 else:
-                    logging.warning(f"SHUTDOWN: Failed to update SL for position {position.ticket} on attempt {attempt}: {result.retcode if result else 'Unknown error'}")
-                    time.sleep(0.3)  # Wait before retry
+                    error_code = result.retcode if result else "Unknown error"
+                    logging.error(f"SHUTDOWN: Failed to close position {position.ticket} on attempt {attempt+1}: {error_code}")
+                    time.sleep(0.5)  # Wait before retry
+            
+            if not success:
+                logging.error(f"SHUTDOWN: Could not close position {position.ticket} after 3 attempts. Setting tight stop loss instead.")
+                # Set a tight stop loss if closure fails
+                current_price = mt5.symbol_info_tick(position.symbol).bid if position.type == mt5.POSITION_TYPE_BUY else mt5.symbol_info_tick(position.symbol).ask
+                sl_price = current_price * 0.995 if position.type == mt5.POSITION_TYPE_BUY else current_price * 1.005
+                
+                sl_request = {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": position.ticket,
+                    "sl": sl_price,
+                    "tp": position.tp  # Keep existing TP
+                }
+                mt5.order_send(sl_request)
         
-        logging.info(f"SHUTDOWN: Updated stop losses for {updated_count}/{position_count} positions")
+        # Verify positions were closed
+        remaining = mt5.positions_get()
+        remaining_count = len(remaining) if remaining else 0
+        logging.warning(f"SHUTDOWN: Closed {closed_count}/{position_count} positions, {remaining_count} remain open")
     
-    logging.info("SHUTDOWN: Improved shutdown sequence completed")
+    logging.warning("SHUTDOWN: Improved shutdown sequence completed")
 
 def setup_error_handling():
     """
@@ -2044,25 +2581,21 @@ def setup_error_handling():
     # Register signal handlers
     import signal
     
-    def signal_handler(signum, frame):
-        signal_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else f"Signal {signum}"
-        logging.warning(f"Received {signal_name}, initiating graceful shutdown")
+def signal_handler(sig, frame):
+    try:
+        # Always force close positions on Ctrl+C by default
+        logging.warning(f"Received {signal.Signals(sig).name}, initiating emergency position closure")
+        improved_shutdown_handler(close_all_positions=True)
         
-        # Set exit flag for threads
-        state.exit_requested = True
+        # Call original handlers for compatibility
+        if hasattr(sys, 'exitfunc'):
+            sys.exitfunc()
         
-        # Run shutdown handler to protect positions
-        enhanced_shutdown_handler()
-        
-        # Wait briefly to let threads see the exit flag
-        time.sleep(2)
-        
-        # Exit with appropriate code
-        if signum == signal.SIGINT:
-            sys.exit(130)  # Standard exit code for SIGINT
-        else:
-            sys.exit(128 + signum)
-    
+        sys.exit(0)
+    except Exception as e:
+        logging.critical(f"Critical error during shutdown: {e}")
+        sys.exit(1)
+
     # Register signal handlers for common termination signals
     for sig in [signal.SIGINT, signal.SIGTERM]:
         try:
@@ -9292,7 +9825,53 @@ def place_market_order(symbol, order_type, lot_size, sl, tp, comment=""):
             if order_result and order_result.retcode == mt5.TRADE_RETCODE_DONE:
                 order_ticket = order_result.order
                 logging.info(f"place_market_order - Market order placed successfully with STRATEGY 6: {order_type} {symbol} {lot_size} lots at {price}")
-                
+                write_trade_notes(f"Opened {order_type} position on {symbol}: {lot_size} lots at {price}, SL: {sl}, TP: {tp}")
+
+                # ADD THE FOLLOWING CODE RIGHT HERE:
+                try:
+                    # Collect technical indicators
+                    atr = calculate_atr(get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"]))
+                    rsi = calculate_rsi(get_candle_data(symbol, MT5_TIMEFRAMES["PRIMARY"]))
+                    macd_signal = 0  # Get your actual MACD value if available
+                    ema_diff = 0     # Get your actual EMA difference if available
+                    risk_reward = abs(tp - price) / abs(price - sl) if sl != price else 0
+                    
+                    # Get volatility and regime info from your already calculated values
+                    volatility_level = calculate_market_volatility(symbol)
+                    market_regime, regime_strength = detect_market_regime(symbol)
+                    
+                    # Get detected patterns
+                    detected_patterns = []
+                    if hasattr(state, 'current_signals') and symbol in state.current_signals:
+                        signal_data = state.current_signals[symbol]
+                        if "chart_patterns" in signal_data:
+                            pattern_data = signal_data["chart_patterns"]
+                            if pattern_data.get("detected", False):
+                                detected_patterns.append(pattern_data.get("pattern", "unknown"))
+                    
+                    # Create trade data dictionary
+                    trade_data = {
+                        'direction': order_type,
+                        'entry_price': price,
+                        'sl_price': sl,
+                        'tp_price': tp,
+                        'lot_size': lot_size,
+                        'risk_reward': risk_reward,
+                        'volatility': volatility_level,
+                        'market_regime': market_regime,
+                        'regime_strength': regime_strength,
+                        'patterns': detected_patterns,
+                        'atr': atr,
+                        'rsi': rsi,
+                        'macd': macd_signal,
+                        'ema_diff': ema_diff
+                    }
+                    
+                    # Save to ML dataset
+                    save_trade_to_ml_dataset(symbol, trade_data)
+                except Exception as e:
+                    logging.error(f"Failed to save trade data for ML: {e}")
+
                 # Add delay before adding SL/TP to ensure order is processed
                 time.sleep(0.5)
                 
@@ -11269,3 +11848,70 @@ if __name__ == "__main__":
             pass
         
     print("Application terminated.")
+
+class BufferedLogFilter(logging.Filter):
+    """Advanced log filter with buffering and aggregation capabilities"""
+    
+    def __init__(self):
+        super().__init__()
+        self.message_counters = {}
+        self.last_emission_time = {}
+        self.suppressed_messages = {}
+        self.emit_interval = 30  # seconds
+        
+        # Critical trading messages that should never be filtered
+        self.critical_patterns = [
+            "position opened",
+            "position closed",
+            "Failed to place order",
+            "order placed successfully",
+            "Updated SL/TP"
+        ]
+        
+        # Patterns to aggressively suppress
+        self.suppress_patterns = [
+            "volatility detected", 
+            "calculate_market_volatility",
+            "DEBUG: Margin level",
+            "detect_market_regime",
+            "Enhanced range detection"
+        ]
+    
+    def filter(self, record):
+        # Always show warnings and errors
+        if record.levelno >= logging.WARNING:
+            return True
+            
+        message = record.getMessage()
+        
+        # Always show critical trading messages
+        for pattern in self.critical_patterns:
+            if pattern.lower() in message.lower():
+                return True
+        
+        # Aggressively suppress certain patterns
+        for pattern in self.suppress_patterns:
+            if pattern in message:
+                key = f"{pattern}"
+                now = time.time()
+                
+                # Initialize counters if needed
+                if key not in self.message_counters:
+                    self.message_counters[key] = 0
+                    self.last_emission_time[key] = 0
+                
+                # Count this suppressed message
+                self.message_counters[key] += 1
+                
+                # Emit a summary log periodically
+                if now - self.last_emission_time.get(key, 0) > self.emit_interval:
+                    if self.message_counters[key] > 1:
+                        logging.info(f"[Suppressed {self.message_counters[key]} similar '{pattern}' logs in the last {self.emit_interval}s]")
+                    self.message_counters[key] = 0
+                    self.last_emission_time[key] = now
+                    return True
+                
+                return False
+        
+        # Allow all other messages
+        return True
