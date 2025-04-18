@@ -10150,8 +10150,6 @@ def place_market_order(symbol, order_type, lot_size, sl, tp, comment=""):
                 logging.warning(f"place_market_order - STRATEGY 6 attempt {retry_attempt} failed: {order_result.retcode if order_result else 'Unknown error'}")
                 time.sleep(0.3)  # Short delay before retry
 
-        return None  # Return None if all attempts fail
-
         # STRATEGY 7: Try with market order type
         market_request = {
             "action": mt5.TRADE_ACTION_DEAL,
